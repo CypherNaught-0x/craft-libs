@@ -8,16 +8,27 @@ use craft_pdf::interpret::{
 use kurbo::{Affine, BezPath, Rect};
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 #[derive(Default)]
 struct Counter {
     paths: usize,
     glyphs: usize,
+    annotation_depth: i32,
+    stop_at_annotations: Option<Arc<AtomicBool>>,
 }
 
 impl Device<'_> for Counter {
+    fn begin_annotations(&mut self) {
+        self.annotation_depth += 1;
+        if let Some(stop) = &self.stop_at_annotations {
+            stop.store(true, Ordering::Relaxed);
+        }
+    }
+    fn end_annotations(&mut self) {
+        self.annotation_depth -= 1;
+    }
     fn set_soft_mask(&mut self, _: Option<SoftMask<'_>>) {}
     fn set_blend_mode(&mut self, _: BlendMode) {}
     fn draw_path(&mut self, _: &BezPath, _: Affine, _: &Paint<'_>, _: &PathDrawMode) {
@@ -34,10 +45,14 @@ impl Device<'_> for Counter {
 }
 
 fn fixture(content: &str, form: &str) -> craft_pdf::syntax::Pdf {
+    fixture_with_annotations(content, form, "")
+}
+
+fn fixture_with_annotations(content: &str, form: &str, annotations: &str) -> craft_pdf::syntax::Pdf {
     let bytes = format!(
         "%PDF-1.7\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n\
          2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n\
-         3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 40 20] /Resources << /Font << /F1 5 0 R >> /XObject << /F0 6 0 R >> >> /Contents 4 0 R >> endobj\n\
+         3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 40 20] /Resources << /Font << /F1 5 0 R >> /XObject << /F0 6 0 R >> >> /Contents 4 0 R {annotations} >> endobj\n\
          4 0 obj << /Length {} >> stream\n{content}\nendstream endobj\n\
          5 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n\
          6 0 obj << /Type /XObject /Subtype /Form /BBox [0 0 40 20] /Resources << >> /Length {} >> stream\n{form}\nendstream endobj\n\
@@ -157,4 +172,21 @@ fn raster_checkpoint_panics_are_guarded_before_drawing_or_allocation() {
     assert!(matches!(raster::render(page, &RenderCache::new(), &settings, &Options::default()), Err(Error::BackendPanic)));
     let mut buffer = vec![0; 40 * 20 * 4];
     assert_eq!(raster::render_into(page, &RenderCache::new(), &settings, &Options::default(), &mut buffer), Err(Error::BackendPanic));
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+fn cancellation_balances_the_annotation_device_scope() {
+    let pdf = fixture_with_annotations("", "", "/Annots [<< /Subtype /Highlight /Rect [0 0 10 10] >>]");
+    let page = pdf.pages().first().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let observed = stop.clone();
+    let settings =
+        InterpreterSettings { cancellation_check: Some(CancellationCheck::new(move || observed.load(Ordering::Relaxed))), ..Default::default() };
+    let cache = InterpreterCache::new();
+    let mut context = Context::new(page.initial_transform(true).to_kurbo(), Rect::new(0.0, 0.0, 40.0, 20.0), &cache, page.xref(), settings);
+    let mut counter = Counter { stop_at_annotations: Some(stop.clone()), ..Default::default() };
+    craft_pdf::interpret_page(page, &mut context, &mut counter).unwrap();
+    assert!(stop.load(Ordering::Relaxed));
+    assert_eq!(counter.annotation_depth, 0, "cancellation must close the device scope opened by the updated backend");
 }
